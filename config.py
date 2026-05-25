@@ -1,6 +1,6 @@
 import pandas as pd
 
-scenario = "with_battery" # "base", "with_battery", "benchmark"
+scenario = "with_battery" # "base", "with_battery"
 pv_cf_lower_limit = 0.9
 SOC_inital = 0.5
 
@@ -17,3 +17,6 @@ multi_timestep_interval = [pd.Timestamp("2018-04-01 12:00:00"),
 alpha = 1.0
 beta = 0
 n_ffor_directions = 32
+
+benchmark_polygon_sides = 16
+benchmark_polygon_type = "outer"  # "outer" polygon or "inner" polygon

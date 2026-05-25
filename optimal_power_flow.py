@@ -582,6 +582,7 @@ def add_static_flexibility_layer(
     model: pyo.ConcreteModel,
     aggregation_per_timestep,
     device_flex_per_timestep=None,
+    flexibility_model: str = "minkowski",
 ) -> pyo.ConcreteModel:
     """
     Adds static nodal flexibility.
@@ -599,6 +600,9 @@ def add_static_flexibility_layer(
       - aggregate cone-radius constraints
       - nodal balance with flexibility
     """
+    if flexibility_model not in ("minkowski", "benchmark_polygon"):
+        raise ValueError(f"Unknown flexibility_model={flexibility_model}")
+
     time_list = list(model.T)
 
     if isinstance(aggregation_per_timestep, pd.DataFrame):
@@ -768,11 +772,6 @@ def add_static_flexibility_layer(
             initialize=S_bat_max_data,
         )
 
-        tan_phi_pv = (
-            np.sqrt(1.0 - config.pv_cf_lower_limit**2)
-            / config.pv_cf_lower_limit
-        )
-
         model.c_pv_p_min = pyo.Constraint(
             model.T,
             model.B_flex,
@@ -783,20 +782,6 @@ def add_static_flexibility_layer(
             model.T,
             model.B_flex,
             rule=lambda m, t, b: m.P_pv_flex[t, b] <= m.P_pv_max[t, b],
-        )
-
-        model.c_pv_q_max = pyo.Constraint(
-            model.T,
-            model.B_flex,
-            rule=lambda m, t, b: m.Q_pv_flex[t, b]
-            <= tan_phi_pv * m.P_pv_flex[t, b],
-        )
-
-        model.c_pv_q_min = pyo.Constraint(
-            model.T,
-            model.B_flex,
-            rule=lambda m, t, b: -m.Q_pv_flex[t, b]
-            <= tan_phi_pv * m.P_pv_flex[t, b],
         )
 
         model.c_hp_p_min = pyo.Constraint(
@@ -823,21 +808,53 @@ def add_static_flexibility_layer(
             rule=lambda m, t, b: -m.P_bat_flex[t, b] <= m.P_chg_max[t, b],
         )
 
-        def bat_s_rule(m, t, b):
-            if pyo.value(m.S_bat_max[t, b]) <= 1e-12:
-                return m.Q_bat_flex[t, b] == 0.0
-
-            return (
-                m.P_bat_flex[t, b] ** 2
-                + m.Q_bat_flex[t, b] ** 2
-                <= m.S_bat_max[t, b] ** 2
+        if flexibility_model == "minkowski":
+            tan_phi_pv = (
+                np.sqrt(1.0 - config.pv_cf_lower_limit**2)
+                / config.pv_cf_lower_limit
             )
 
-        model.c_bat_s = pyo.Constraint(
-            model.T,
-            model.B_flex,
-            rule=bat_s_rule,
-        )
+            model.c_pv_q_max = pyo.Constraint(
+                model.T,
+                model.B_flex,
+                rule=lambda m, t, b: m.Q_pv_flex[t, b]
+                <= tan_phi_pv * m.P_pv_flex[t, b],
+            )
+
+            model.c_pv_q_min = pyo.Constraint(
+                model.T,
+                model.B_flex,
+                rule=lambda m, t, b: -m.Q_pv_flex[t, b]
+                <= tan_phi_pv * m.P_pv_flex[t, b],
+            )
+
+            def bat_s_rule(m, t, b):
+                if pyo.value(m.S_bat_max[t, b]) <= 1e-12:
+                    return m.Q_bat_flex[t, b] == 0.0
+
+                return (
+                    m.P_bat_flex[t, b] ** 2
+                    + m.Q_bat_flex[t, b] ** 2
+                    <= m.S_bat_max[t, b] ** 2
+                )
+
+            model.c_bat_s = pyo.Constraint(
+                model.T,
+                model.B_flex,
+                rule=bat_s_rule,
+            )
+        else:
+            model.c_pv_q_max = pyo.Constraint(
+                model.T,
+                model.B_flex,
+                rule=lambda m, t, b: m.Q_pv_flex[t, b] == 0.0,
+            )
+
+            model.c_pv_q_min = pyo.Constraint(
+                model.T,
+                model.B_flex,
+                rule=lambda m, t, b: m.Q_bat_flex[t, b] == m.Q_flex[t, b],
+            )
 
         model.c_p_flex_decomposition = pyo.Constraint(
             model.T,
@@ -848,13 +865,14 @@ def add_static_flexibility_layer(
             + m.P_bat_flex[t, b],
         )
 
-        model.c_q_flex_decomposition = pyo.Constraint(
-            model.T,
-            model.B_flex,
-            rule=lambda m, t, b: m.Q_flex[t, b]
-            == m.Q_pv_flex[t, b]
-            + m.Q_bat_flex[t, b],
-        )
+        if flexibility_model == "minkowski":
+            model.c_q_flex_decomposition = pyo.Constraint(
+                model.T,
+                model.B_flex,
+                rule=lambda m, t, b: m.Q_flex[t, b]
+                == m.Q_pv_flex[t, b]
+                + m.Q_bat_flex[t, b],
+            )
 
     linear_index = []
     H_0 = {}
@@ -998,6 +1016,7 @@ def setup_single_timestep_OPF(
     timestep,
     aggregation_df: pd.DataFrame,
     device_flex_df: pd.DataFrame | None = None,
+    flexibility_model: str = "minkowski",
 ) -> pyo.ConcreteModel:
     """
     Builds a single-timestep OPF with the current static flexibility layer.
@@ -1013,6 +1032,7 @@ def setup_single_timestep_OPF(
         device_flex_per_timestep={t: device_flex_df}
         if device_flex_df is not None
         else None,
+        flexibility_model=flexibility_model,
     )
 
     model = add_pcc_flexibility_constraints(model)
@@ -1032,6 +1052,7 @@ def setup_multi_timestep_OPF(
     T_preferred: float = config.T_room_initial,
     T_min: float = 18.0,
     T_max: float = 22.0,
+    flexibility_model: str = "minkowski",
 ) -> pyo.ConcreteModel:
     """
     Builds a multi-timestep OPF.
@@ -1048,6 +1069,7 @@ def setup_multi_timestep_OPF(
         model=model,
         aggregation_per_timestep=aggregation_per_timestep,
         device_flex_per_timestep=device_flex_per_timestep,
+        flexibility_model=flexibility_model,
     )
 
     model = add_pcc_flexibility_constraints(model)
