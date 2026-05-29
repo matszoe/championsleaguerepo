@@ -29,19 +29,23 @@ def generate_ffor_directions(n_directions: int):
     return directions
 
 
-def benchmark_output_dir() -> str:
+def benchmark_output_dir(time_steps, duration_h: int) -> str:
     return (
         f"01-RESULTS/multi_ts_benchmark_{config.scenario}_"
-        f"{config.multi_timestep_interval[0].strftime('%m-%d_%H-%M')}--"
-        f"{config.multi_timestep_interval[1].strftime('%m-%d_%H-%M')}"
+        f"{time_steps[0].strftime('%m-%d_%H-%M')}_"
+        f"d{duration_h}h"
     )
 
 
-def save_benchmark_multi_direction_results(all_results: list[dict]):
+def save_benchmark_multi_direction_results(
+    all_results: list[dict],
+    time_steps,
+    duration_h: int,
+):
     """
     Saves benchmark optimization results for multiple alpha/beta directions.
     """
-    output_dir = benchmark_output_dir()
+    output_dir = benchmark_output_dir(time_steps, duration_h)
     os.makedirs(output_dir, exist_ok=True)
 
     vertex_rows = []
@@ -58,6 +62,7 @@ def save_benchmark_multi_direction_results(all_results: list[dict]):
 
         vertex_rows.append({
             "direction_id": direction_id,
+            "duration_h": duration_h,
             "theta_rad": theta_rad,
             "theta_deg": theta_deg,
             "alpha": alpha,
@@ -76,6 +81,7 @@ def save_benchmark_multi_direction_results(all_results: list[dict]):
         for t in res["P_pcc"].keys():
             pcc_rows.append({
                 "direction_id": direction_id,
+                "duration_h": duration_h,
                 "theta_rad": theta_rad,
                 "theta_deg": theta_deg,
                 "alpha": alpha,
@@ -90,6 +96,7 @@ def save_benchmark_multi_direction_results(all_results: list[dict]):
         for (t, bus), P_flex in res["P_flex"].items():
             flex_rows.append({
                 "direction_id": direction_id,
+                "duration_h": duration_h,
                 "theta_rad": theta_rad,
                 "theta_deg": theta_deg,
                 "alpha": alpha,
@@ -105,18 +112,51 @@ def save_benchmark_multi_direction_results(all_results: list[dict]):
                 "Q_bat_flex_benchmark": res.get("Q_bat_flex", {}).get((t, bus), np.nan),
             })
 
-    pd.DataFrame(vertex_rows).to_csv(
+    vertices_df = pd.DataFrame(vertex_rows)
+    pcc_df = pd.DataFrame(pcc_rows)
+    flex_df = pd.DataFrame(flex_rows)
+
+    vertices_df.to_csv(
         os.path.join(output_dir, "ffor_vertices_benchmark.csv"),
         index=False,
     )
-    pd.DataFrame(pcc_rows).to_csv(
+    pcc_df.to_csv(
         os.path.join(output_dir, "pcc_results_all_directions_benchmark.csv"),
         index=False,
     )
-    pd.DataFrame(flex_rows).to_csv(
+    flex_df.to_csv(
         os.path.join(output_dir, "flex_results_all_directions_benchmark.csv"),
         index=False,
     )
+
+    vertices_df.rename(
+        columns={
+            "obj_value_benchmark": "obj_value",
+            "P_flex_pcc_benchmark": "P_flex_pcc",
+            "Q_flex_pcc_benchmark": "Q_flex_pcc",
+        }
+    ).to_csv(os.path.join(output_dir, "ffor_vertices.csv"), index=False)
+
+    pcc_df.rename(
+        columns={
+            "P_pcc_benchmark": "P_pcc",
+            "Q_pcc_benchmark": "Q_pcc",
+            "P_flex_pcc_benchmark": "P_flex_pcc",
+            "Q_flex_pcc_benchmark": "Q_flex_pcc",
+        }
+    ).to_csv(os.path.join(output_dir, "pcc_results_all_directions.csv"), index=False)
+
+    flex_df.rename(
+        columns={
+            "P_flex_benchmark": "P_flex",
+            "Q_flex_benchmark": "Q_flex",
+            "P_pv_flex_benchmark": "P_pv_flex",
+            "Q_pv_flex_benchmark": "Q_pv_flex",
+            "P_hp_flex_benchmark": "P_hp_flex",
+            "P_bat_flex_benchmark": "P_bat_flex",
+            "Q_bat_flex_benchmark": "Q_bat_flex",
+        }
+    ).to_csv(os.path.join(output_dir, "flex_results_all_directions.csv"), index=False)
 
     print(f"Saved benchmark results to: {output_dir}")
 
@@ -129,18 +169,7 @@ def main():
     ###########################################################
     """)
     print(f"Running physical scenario: {config.scenario}")
-    print("Benchmark multi timestep optimization")
-    print(
-        "Time interval: "
-        f"{config.multi_timestep_interval[0]} to "
-        f"{config.multi_timestep_interval[1]}"
-    )
-
-    time_steps = pd.date_range(
-        start=config.multi_timestep_interval[0],
-        end=config.multi_timestep_interval[1],
-        freq="h",
-    )
+    print("Benchmark sustained-duration sweep")
 
     print("Mapping load time series and estimating correlations")
     net_data = opf.load_network_and_extract()
@@ -156,15 +185,6 @@ def main():
         index_col="date",
     )
     temp_df.index = pd.DatetimeIndex(temp_df.index).tz_localize(None)
-    missing_temp = time_steps.difference(temp_df.index)
-    if len(missing_temp) > 0:
-        raise ValueError(f"Missing temperature data for: {missing_temp}")
-
-    hp_base_df = pd.DataFrame(index=correlation_df.index, columns=time_steps)
-    for t in time_steps:
-        temp_t = float(temp_df.loc[t, "temperature_2m"])
-        hp_base_t = nfa_benchmark.compute_hp_baseline(correlation_df, temp_t)
-        hp_base_df[t] = hp_base_t["P_hp_max"] / net_data["S_base"]
 
     pv_df = pd.read_csv(
         "00-INPUT-DATA/PV-DATA/PV_timeseries.csv",
@@ -172,134 +192,161 @@ def main():
         index_col="time",
     )
     pv_df.index = pd.DatetimeIndex(pv_df.index).tz_localize(None)
-    missing_pv = time_steps.difference(pv_df.index)
-    if len(missing_pv) > 0:
-        raise ValueError(f"Missing PV data for: {missing_pv}")
-    pv_cf = pv_df.loc[time_steps, "electricity"]
 
-    aggregation_per_timestep = {}
-    device_flex_per_timestep = {}
-
-    for t in time_steps:
-        device_flex_t = pd.DataFrame(
-            columns=[
-                "P_PV_max",
-                "P_hp_flex_min",
-                "P_hp_flex_max",
-                "P_chg_max",
-                "P_dis_max",
-                "S_bat_max",
-            ],
-            index=correlation_df.index,
+    for duration_h in config.sustained_durations_h:
+        print(
+            f"\n{'=' * 60}\n"
+            f"Solving benchmark FFOR for sustained duration = {duration_h} h\n"
+            f"{'=' * 60}"
         )
 
-        device_flex_t["P_PV_max"] = (
-            pv_cf.loc[t] * correlation_df["cap_pv_mw"] / net_data["S_base"]
+        time_steps = pd.date_range(
+            start=config.start_time,
+            periods=duration_h,
+            freq=config.timestep_freq,
         )
 
-        P_hp_base = hp_base_df[t]
-        P_hp_rated = correlation_df["cap_hp_mw"] / net_data["S_base"]
-
-        device_flex_t["P_hp_flex_max"] = P_hp_base
-        device_flex_t["P_hp_flex_min"] = P_hp_base - P_hp_rated
-
-        if config.scenario == "with_battery":
-            P_bat_rated = correlation_df["cap_battery_mw"] / net_data["S_base"]
-            device_flex_t["P_chg_max"] = P_bat_rated
-            device_flex_t["P_dis_max"] = P_bat_rated
-            device_flex_t["S_bat_max"] = P_bat_rated
-        else:
-            device_flex_t["P_chg_max"] = 0.0
-            device_flex_t["P_dis_max"] = 0.0
-            device_flex_t["S_bat_max"] = 0.0
-
-        aggregation_df_t = pd.DataFrame(
-            columns=["H", "h", "d_soc"],
-            index=device_flex_t.index,
-        )
-
-        for node in tqdm(
-            device_flex_t.index,
-            desc=f"Computing benchmark nodal polygons for {t}",
-        ):
-            H, h, d_soc = nfa_benchmark.compute_nodal_approx_benchmark_polygon(
-                P_pv_max=float(device_flex_t.loc[node, "P_PV_max"]),
-                P_hp_flex_min=float(device_flex_t.loc[node, "P_hp_flex_min"]),
-                P_hp_flex_max=float(device_flex_t.loc[node, "P_hp_flex_max"]),
-                P_chg_max=float(device_flex_t.loc[node, "P_chg_max"]),
-                P_dis_max=float(device_flex_t.loc[node, "P_dis_max"]),
-                S_bat_max=float(device_flex_t.loc[node, "S_bat_max"]),
+        missing_temp = time_steps.difference(temp_df.index)
+        missing_pv = time_steps.difference(pv_df.index)
+        if len(missing_temp) or len(missing_pv):
+            raise ValueError(
+                f"Missing data for duration {duration_h}h: "
+                f"temp={list(missing_temp)}, pv={list(missing_pv)}"
             )
 
-            aggregation_df_t.loc[node] = {
-                "H": H,
-                "h": h,
-                "d_soc": d_soc,
-            }
+        hp_base_df = pd.DataFrame(index=correlation_df.index, columns=time_steps)
+        for t in time_steps:
+            temp_t = float(temp_df.loc[t, "temperature_2m"])
+            hp_base_t = nfa_benchmark.compute_hp_baseline(correlation_df, temp_t)
+            hp_base_df[t] = hp_base_t["P_hp_max"] / net_data["S_base"]
 
-        device_flex_per_timestep[t] = device_flex_t.copy()
-        aggregation_per_timestep[t] = aggregation_df_t
+        pv_cf = pv_df.loc[time_steps, "electricity"]
 
-    print("Loading network data and setting up benchmark OPF")
-    bus_lookup = net_data["net"]._pd2ppc_lookups["bus"]
+        aggregation_per_timestep = {}
+        device_flex_per_timestep = {}
 
-    device_flex_per_timestep = {
-        t: df.set_index(df.index.map(lambda i: int(bus_lookup[i])))
-        for t, df in device_flex_per_timestep.items()
-    }
-    aggregation_per_timestep = {
-        t: df.set_index(df.index.map(lambda i: int(bus_lookup[i])))
-        for t, df in aggregation_per_timestep.items()
-    }
-    hp_base_df.index = [int(bus_lookup[i]) for i in hp_base_df.index]
+        for t in time_steps:
+            device_flex_t = pd.DataFrame(
+                columns=[
+                    "P_PV_max",
+                    "P_hp_flex_min",
+                    "P_hp_flex_max",
+                    "P_chg_max",
+                    "P_dis_max",
+                    "S_bat_max",
+                ],
+                index=correlation_df.index,
+            )
 
-    full_model = opf.setup_multi_timestep_OPF(
-        load_df,
-        net_data,
-        time_steps,
-        aggregation_per_timestep,
-        device_flex_per_timestep,
-        hp_base_df,
-        temp_df,
-        flexibility_model="benchmark_polygon",
-    )
+            device_flex_t["P_PV_max"] = (
+                pv_cf.loc[t] * correlation_df["cap_pv_mw"] / net_data["S_base"]
+            )
 
-    print("Solving benchmark OPF model with Gurobi for multiple FFOR directions")
+            P_hp_base = hp_base_df[t]
+            P_hp_rated = correlation_df["cap_hp_mw"] / net_data["S_base"]
 
-    directions = generate_ffor_directions(config.n_ffor_directions)
-    log_dir = os.path.join(benchmark_output_dir(), "gurobi_logs")
-    os.makedirs(log_dir, exist_ok=True)
+            device_flex_t["P_hp_flex_max"] = P_hp_base
+            device_flex_t["P_hp_flex_min"] = P_hp_base - P_hp_rated
 
-    all_results = []
+            if config.scenario == "with_battery":
+                P_bat_rated = correlation_df["cap_battery_mw"] / net_data["S_base"]
+                device_flex_t["P_chg_max"] = P_bat_rated
+                device_flex_t["P_dis_max"] = P_bat_rated
+                device_flex_t["S_bat_max"] = P_bat_rated
+            else:
+                device_flex_t["P_chg_max"] = 0.0
+                device_flex_t["P_dis_max"] = 0.0
+                device_flex_t["S_bat_max"] = 0.0
 
-    for direction in tqdm(directions, desc="Solving benchmark FFOR directions"):
-        direction_id = direction["direction_id"]
-        theta_deg = direction["theta_deg"]
-        alpha = direction["alpha"]
-        beta = direction["beta"]
+            aggregation_df_t = pd.DataFrame(
+                columns=["H", "h", "d_soc"],
+                index=device_flex_t.index,
+            )
 
-        print(
-            f"\nSolving benchmark direction {direction_id + 1}/{len(directions)}: "
-            f"theta={theta_deg:.1f} deg, alpha={alpha:.4f}, beta={beta:.4f}"
+            for node in tqdm(
+                device_flex_t.index,
+                desc=f"Computing benchmark nodal polygons for {t}",
+            ):
+                H, h, d_soc = nfa_benchmark.compute_nodal_approx_benchmark_polygon(
+                    P_pv_max=float(device_flex_t.loc[node, "P_PV_max"]),
+                    P_hp_flex_min=float(device_flex_t.loc[node, "P_hp_flex_min"]),
+                    P_hp_flex_max=float(device_flex_t.loc[node, "P_hp_flex_max"]),
+                    P_chg_max=float(device_flex_t.loc[node, "P_chg_max"]),
+                    P_dis_max=float(device_flex_t.loc[node, "P_dis_max"]),
+                    S_bat_max=float(device_flex_t.loc[node, "S_bat_max"]),
+                )
+
+                aggregation_df_t.loc[node] = {"H": H, "h": h, "d_soc": d_soc}
+
+            device_flex_per_timestep[t] = device_flex_t.copy()
+            aggregation_per_timestep[t] = aggregation_df_t
+
+        print("Loading network data and setting up benchmark OPF")
+        bus_lookup = net_data["net"]._pd2ppc_lookups["bus"]
+
+        device_flex_per_timestep = {
+            t: df.set_index(df.index.map(lambda i: int(bus_lookup[i])))
+            for t, df in device_flex_per_timestep.items()
+        }
+        aggregation_per_timestep = {
+            t: df.set_index(df.index.map(lambda i: int(bus_lookup[i])))
+            for t, df in aggregation_per_timestep.items()
+        }
+        hp_base_df.index = [int(bus_lookup[i]) for i in hp_base_df.index]
+
+        full_model = opf.setup_multi_timestep_OPF(
+            load_df,
+            net_data,
+            time_steps,
+            aggregation_per_timestep,
+            device_flex_per_timestep,
+            hp_base_df,
+            temp_df,
+            flexibility_model="benchmark_polygon",
         )
 
-        res = opf.solve_OPF(
-            full_model,
-            alpha,
-            beta,
-            log_file=os.path.join(log_dir, f"direction_{direction_id:02d}.log"),
+        print("Solving benchmark OPF model with Gurobi for multiple FFOR directions")
+
+        directions = generate_ffor_directions(config.n_ffor_directions)
+        log_dir = os.path.join(
+            benchmark_output_dir(time_steps, duration_h),
+            "gurobi_logs",
         )
+        os.makedirs(log_dir, exist_ok=True)
 
-        res["direction_id"] = direction_id
-        res["theta_rad"] = direction["theta_rad"]
-        res["theta_deg"] = theta_deg
-        res["alpha"] = alpha
-        res["beta"] = beta
+        all_results = []
 
-        all_results.append(res)
+        for direction in tqdm(
+            directions,
+            desc=f"Solving benchmark FFOR directions (d={duration_h}h)",
+        ):
+            direction_id = direction["direction_id"]
+            theta_deg = direction["theta_deg"]
+            alpha = direction["alpha"]
+            beta = direction["beta"]
 
-    print("Saving benchmark multi-direction results")
-    save_benchmark_multi_direction_results(all_results)
+            print(
+                f"\nSolving benchmark direction {direction_id + 1}/{len(directions)}: "
+                f"theta={theta_deg:.1f} deg, alpha={alpha:.4f}, beta={beta:.4f}"
+            )
+
+            res = opf.solve_OPF(
+                full_model,
+                alpha,
+                beta,
+                log_file=os.path.join(log_dir, f"direction_{direction_id:02d}.log"),
+            )
+
+            res["direction_id"] = direction_id
+            res["theta_rad"] = direction["theta_rad"]
+            res["theta_deg"] = theta_deg
+            res["alpha"] = alpha
+            res["beta"] = beta
+
+            all_results.append(res)
+
+        print("Saving benchmark multi-direction results")
+        save_benchmark_multi_direction_results(all_results, time_steps, duration_h)
 
 
 if __name__ == "__main__":
