@@ -1,3 +1,6 @@
+
+optimization project on champions league level. only for the real ones
+
 # Distribution Grid Flexibility Approximation
 
 This repository computes flexibility feasible operating regions (FFORs) for a
